@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Empathy Mirror Pro</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .history-scroll::-webkit-scrollbar { width: 6px; }
+        .history-scroll::-webkit-scrollbar-track { background: #0f172a; }
+        .history-scroll::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+        .bar-transition { transition: width 0.3s ease-out; }
+    </style>
+</head>
+<body class="bg-[#02040a] text-white p-4 lg:p-8 font-sans min-h-screen flex justify-center">
+
+    <div class="max-w-[1400px] w-full grid grid-cols-1 lg:grid-cols-12 gap-6">
+        
+        <div class="lg:col-span-8 flex flex-col gap-6">
+            <div class="relative rounded-[2rem] border-2 border-slate-800 overflow-hidden shadow-2xl bg-black aspect-video group">
+                <img src="{{ url_for('video_feed') }}" class="w-full h-full object-cover opacity-90 group-hover:opacity-100 transition-opacity">
+                
+                <div class="absolute top-6 left-6 backdrop-blur-md bg-black/40 border border-white/10 px-4 py-2 rounded-2xl">
+                    <p class="text-[10px] uppercase font-bold tracking-widest text-slate-400 mb-1">Detected Emotion</p>
+                    <h1 id="dominant-emo" class="text-3xl font-black text-white uppercase tracking-tighter">Scanning...</h1>
+                </div>
+
+                <div class="absolute bottom-6 left-6 backdrop-blur-md bg-black/60 border border-white/10 px-3 py-1 rounded-full flex items-center gap-2">
+                    <div id="status-dot" class="w-2 h-2 rounded-full bg-yellow-500 animate-pulse"></div>
+                    <p id="system-status" class="text-[10px] uppercase font-bold text-white tracking-widest">Initializing...</p>
+                </div>
+            </div>
+
+            <div class="bg-[#0f111a] p-6 rounded-[2rem] border border-slate-800 shadow-xl">
+                <h3 class="text-xs font-bold text-slate-500 uppercase tracking-widest mb-4">Real-time Emotional Spectrum</h3>
+                <div class="grid grid-cols-2 md:grid-cols-4 gap-4" id="spectrum-container">
+                    </div>
+            </div>
+        </div>
+
+        <div class="lg:col-span-4 flex flex-col gap-6 h-full">
+            <div class="bg-indigo-900/10 p-6 rounded-[2rem] border border-indigo-500/20">
+                <div class="flex items-center justify-between mb-3">
+                    <p class="text-[10px] font-bold text-indigo-400 uppercase tracking-widest">AI Coach</p>
+                    <span id="impact-badge" class="px-2 py-1 rounded text-[10px] font-bold bg-slate-800 text-slate-400">WAITING</span>
+                </div>
+                <p id="advice-text" class="text-lg font-medium text-indigo-100 leading-snug">"Speak clearly to begin analysis."</p>
+            </div>
+
+            <div class="bg-[#0f111a] rounded-[2rem] border border-slate-800 flex flex-col flex-grow overflow-hidden h-[500px] lg:h-auto">
+                <div class="p-5 border-b border-slate-800 bg-[#0f111a]">
+                    <h3 class="font-bold text-slate-200">Transcript Log</h3>
+                </div>
+                <div id="history-log" class="flex-grow overflow-y-auto history-scroll p-4 space-y-3">
+                    <div class="text-center text-slate-700 text-xs mt-10 italic">History will appear here...</div>
+                </div>
+                <div class="p-4 border-t border-slate-800">
+                    <a href="/download_report" class="flex items-center justify-center w-full bg-slate-800 hover:bg-slate-700 py-3 rounded-xl font-bold text-xs uppercase tracking-widest transition-all">Download Report</a>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const emotions = ['happy', 'sad', 'angry', 'fear', 'surprise', 'neutral', 'disgust'];
+        const container = document.getElementById('spectrum-container');
+        emotions.forEach(emo => {
+            container.innerHTML += `
+                <div class="bg-black/40 p-3 rounded-xl border border-slate-800/50">
+                    <div class="flex justify-between mb-1">
+                        <span class="text-[10px] uppercase font-bold text-slate-400">${emo}</span>
+                        <span id="val-${emo}" class="text-[10px] font-mono text-slate-500">0%</span>
+                    </div>
+                    <div class="w-full bg-slate-800 h-1.5 rounded-full overflow-hidden">
+                        <div id="bar-${emo}" class="h-full bg-indigo-500 w-0 bar-transition"></div>
+                    </div>
+                </div>`;
+        });
+
+        let lastHistoryLength = 0;
+
+        setInterval(() => {
+            fetch('/data')
+                .then(res => res.json())
+                .then(data => {
+                    // Update Status Dot
+                    document.getElementById('system-status').innerText = data.status;
+                    const dot = document.getElementById('status-dot');
+                    if(data.status === "Listening") dot.className = "w-2 h-2 rounded-full bg-emerald-500 animate-pulse";
+                    else if(data.status === "Analyzing...") dot.className = "w-2 h-2 rounded-full bg-blue-500 animate-ping";
+                    else dot.className = "w-2 h-2 rounded-full bg-yellow-500";
+
+                    // Update Visuals
+                    document.getElementById('dominant-emo').innerText = data.visual_emotion;
+                    document.getElementById('advice-text').innerText = data.advice;
+                    document.getElementById('impact-badge').innerText = data.impact_label;
+
+                    if (data.emotion_spectrum) {
+                        emotions.forEach(emo => {
+                            const val = data.emotion_spectrum[emo] || 0;
+                            document.getElementById(`bar-${emo}`).style.width = val + "%";
+                            document.getElementById(`val-${emo}`).innerText = Math.round(val) + "%";
+                        });
+                    }
+
+                    if (data.history.length > lastHistoryLength) {
+                        const logContainer = document.getElementById('history-log');
+                        if (lastHistoryLength === 0) logContainer.innerHTML = ''; 
+                        for (let i = 0; i < (data.history.length - lastHistoryLength); i++) {
+                            const item = data.history[i]; 
+                            let border = item.impact.includes("High") ? "border-emerald-500" : (item.impact.includes("Mixed") ? "border-rose-500" : "border-slate-700");
+                            logContainer.innerHTML = `
+                                <div class="bg-slate-800/40 p-3 rounded-lg border-l-2 ${border} animate-pulse">
+                                    <div class="flex justify-between items-center mb-1">
+                                        <span class="text-[10px] text-slate-500 font-mono">${item.time}</span>
+                                        <span class="text-[9px] uppercase font-bold text-slate-400 bg-black/30 px-1.5 rounded">${item.emotion}</span>
+                                    </div>
+                                    <p class="text-xs text-slate-300">"${item.text}"</p>
+                                </div>` + logContainer.innerHTML;
+                        }
+                        lastHistoryLength = data.history.length;
+                    }
+                });
+        }, 500);
+    </script>
+</body>
+</html>
