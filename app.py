@@ -1,67 +1,98 @@
 import cv2
 import threading
 import speech_recognition as sr
-from flask import Flask, render_template, Response, jsonify, send_file
-from deepface import DeepFace
-from textblob import TextBlob
+import numpy as np
+import json
 import time
 import datetime
 import io
+import logging
+from flask import Flask, render_template, Response, jsonify, send_file, request
+from flask.json.provider import DefaultJSONProvider
+from deepface import DeepFace
+from textblob import TextBlob
 
+# --- 1. SETUP & CONFIG ---
 app = Flask(__name__)
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
 
-# GLOBAL STATE
+# --- 2. JSON FIX (Prevents Crashes) ---
+class NumpyJSONProvider(DefaultJSONProvider):
+    def default(self, obj):
+        if isinstance(obj, (np.integer, np.floating)):
+            return float(obj) if isinstance(obj, np.floating) else int(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
+app.json = NumpyJSONProvider(app)
+
+# --- 3. STATE ---
 mirror_state = {
     "visual_emotion": "neutral",
     "emotion_spectrum": {},
-    "current_transcript": "Waiting for speech...",
+    "current_transcript": "Ready.",
     "impact_label": "Ready",
-    "advice": "System is listening. Speak clearly.",
+    "advice": "System ready.",
     "history": [],
-    "status": "Idle"
+    "status": "Idle",
+    "session_start": datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 }
 
-def audio_processor():
+# --- 4. FAST AUDIO ENGINE ---
+def audio_loop():
     recognizer = sr.Recognizer()
     
-    # Settings for Real-Time Speech
-    recognizer.energy_threshold = 300
-    recognizer.dynamic_energy_threshold = True
-    recognizer.pause_threshold = 0.5
+    # LATENCY OPTIMIZATION SETTINGS
+    recognizer.energy_threshold = 300      # Fixed threshold is faster than dynamic
+    recognizer.dynamic_energy_threshold = False 
+    recognizer.pause_threshold = 0.4       # Stop listening after 0.4s of silence (Very Fast)
+    recognizer.non_speaking_duration = 0.3 # Buffer size
     
-    # IF MIC IS NOT WORKING, PUT YOUR ID HERE (e.g., device_index=1)
+    # mic_id = 1  <-- UNCOMMENT AND SET THIS IF MIC ISN'T WORKING
     mic_id = None 
-    
+
     with sr.Microphone(device_index=mic_id) as source:
-        print("--- CALIBRATING BACKGROUND NOISE... ---")
-        mirror_state["status"] = "Calibrating..."
-        recognizer.adjust_for_ambient_noise(source, duration=1)
-        print("--- LISTENING ---")
-        mirror_state["status"] = "Listening"
+        print(">> AUDIO: Calibrating (0.5s)...")
+        recognizer.adjust_for_ambient_noise(source, duration=0.5)
+        mirror_state["status"] = "Active"
+        print(">> AUDIO: Started.")
 
         while True:
             try:
-                audio = recognizer.listen(source, timeout=None, phrase_time_limit=3)
-                mirror_state["status"] = "Analyzing..."
-                text = recognizer.recognize_google(audio)
+                # phrase_time_limit=2 forces an update every 2 seconds
+                # This makes the transcript feel "streaming" rather than blocked
+                audio = recognizer.listen(source, timeout=None, phrase_time_limit=2)
                 
-                # Logic
-                sentiment = TextBlob(text).sentiment.polarity
+                try:
+                    text = recognizer.recognize_google(audio)
+                except sr.UnknownValueError:
+                    continue # Skip empty audio to save processing time
+                
+                # Instant Logic
+                blob = TextBlob(text)
+                sentiment = blob.sentiment.polarity
                 visual = mirror_state["visual_emotion"]
                 
+                # Impact Calculation
                 impact = "Neutral"
-                advice = "Keep going."
+                advice = "Keep flowing."
                 
                 if sentiment > 0.1 and visual in ['happy', 'surprise']:
                     impact = "High Resonance"
-                    advice = "Great energy!"
+                    advice = "Great energy match!"
                 elif sentiment > 0.1 and visual in ['sad', 'angry', 'fear']:
                     impact = "Mixed Signals"
-                    advice = "Positive words, but tense face."
+                    advice = "Positive words, tense face."
                 elif sentiment < -0.1 and visual in ['happy']:
                     impact = "Masking"
-                    advice = "You're smiling while saying something negative."
+                    advice = "Smiling through negative news."
+                elif visual == 'neutral':
+                    impact = "Steady"
+                    advice = "Add emotion to emphasize points."
 
+                # Update State
                 timestamp = datetime.datetime.now().strftime("%H:%M:%S")
                 entry = {
                     "time": timestamp,
@@ -74,14 +105,15 @@ def audio_processor():
                 mirror_state["impact_label"] = impact
                 mirror_state["advice"] = advice
                 mirror_state["history"].insert(0, entry)
-                mirror_state["status"] = "Listening"
                 
-            except:
-                mirror_state["status"] = "Listening"
-                continue
+            except Exception as e:
+                print(f"Audio Error: {e}")
+                time.sleep(0.1)
 
-def video_processor():
+# --- 5. VIDEO ENGINE ---
+def video_loop():
     cap = cv2.VideoCapture(0)
+    # Low Resolution = Low Latency
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     
@@ -89,44 +121,49 @@ def video_processor():
         success, frame = cap.read()
         if not success: break
         
-        if int(time.time() * 10) % 5 == 0:
+        # Analyze every 4th frame (approx 7.5fps analysis)
+        if int(time.time() * 100) % 4 == 0:
             try:
-                res = DeepFace.analyze(frame, actions=['emotion'], enforce_detection=False, detector_backend='opencv', silent=True)
-                
-                # --- THE FIX IS HERE ---
-                # We convert the numpy float32 values to standard python floats
-                raw_emotions = res[0]['emotion']
-                clean_emotions = {k: float(v) for k, v in raw_emotions.items()}
-                
-                mirror_state["emotion_spectrum"] = clean_emotions
-                mirror_state["visual_emotion"] = res[0]['dominant_emotion']
+                result = DeepFace.analyze(
+                    frame, 
+                    actions=['emotion'], 
+                    enforce_detection=False, 
+                    detector_backend='opencv', 
+                    silent=True
+                )
+                mirror_state["emotion_spectrum"] = result[0]['emotion']
+                mirror_state["visual_emotion"] = result[0]['dominant_emotion']
             except: pass
 
-        _, buffer = cv2.imencode('.jpg', frame)
+        _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
         yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
 
+# --- 6. ROUTES ---
 @app.route('/')
 def index(): return render_template('index.html')
 
 @app.route('/video_feed')
-def video_feed(): return Response(video_processor(), mimetype='multipart/x-mixed-replace; boundary=frame')
+def video_feed(): return Response(video_loop(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 @app.route('/data')
 def get_data(): return jsonify(mirror_state)
 
-@app.route('/download_report')
-def download_report():
+@app.route('/download')
+def download():
     output = io.BytesIO()
-    report_text = f"EMPATHY MIRROR SESSION - {datetime.datetime.now()}\n"
-    report_text += "="*50 + "\n\n"
-    for entry in mirror_state["history"]:
-        report_text += f"[{entry['time']}] {entry['text']}\n"
-        report_text += f"   > Emotion: {entry['emotion']} | Impact: {entry['impact']}\n"
-        report_text += "-"*30 + "\n"
-    output.write(report_text.encode('utf-8'))
+    s = mirror_state
+    txt = f"SESSION REPORT - {s['session_start']}\n{'='*50}\n"
+    for item in s["history"]:
+        txt += f"[{item['time']}] {item['text']}\n"
+        txt += f"    > Face: {item['emotion']} | Impact: {item['impact']}\n{'-'*30}\n"
+    output.write(txt.encode('utf-8'))
     output.seek(0)
-    return send_file(output, mimetype="text/plain", as_attachment=True, download_name="session_history.txt")
+    return send_file(output, as_attachment=True, download_name="report.txt", mimetype="text/plain")
 
 if __name__ == '__main__':
-    threading.Thread(target=audio_processor, daemon=True).start()
-    app.run(host='0.0.0.0', port=5000, threaded=True)
+    threading.Thread(target=audio_loop, daemon=True).start()
+    from waitress import serve
+    print("---------------------------------------")
+    print(" SERVER STARTED: http://localhost:8080")
+    print("---------------------------------------")
+    serve(app, host='0.0.0.0', port=8080, threads=6)
